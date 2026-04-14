@@ -87,6 +87,8 @@ def create_packages_config_gui(master=None, components=None, on_change=None):
     has_saved_geometry = apply_saved_geometry(root, "PackagesConfig")
 
     root.title("Packages Configuration")
+    root.columnconfigure(0, weight=1)
+    root.rowconfigure(0, weight=1)
 
     # Main frame
     main_frame = ttk.Frame(root, padding="10")
@@ -246,6 +248,9 @@ def create_packages_config_gui(master=None, components=None, on_change=None):
 
     # Run the GUI
     def on_resize(event):
+        if event.widget != root:
+            return
+
         # Update column widths when window is resized
         if tree.winfo_width() > 200:
             # Get the total width available for the three columns
@@ -255,11 +260,11 @@ def create_packages_config_gui(master=None, components=None, on_change=None):
             # Calculate remaining width for the three editable columns
             remaining_width = total_width - count_width
             if remaining_width > 0:
-                # Distribute remaining width equally among the three columns
-                column_width = remaining_width // 3
-                tree.column("Package", width=column_width)
-                tree.column("Width (mm)", width=column_width)
-                tree.column("Length (mm)", width=column_width)
+                # Distribute remaining width proportionally
+                # Package gets 40%, dimensions get 30% each
+                tree.column("Package", width=int(remaining_width * 0.4))
+                tree.column("Width (mm)", width=int(remaining_width * 0.3))
+                tree.column("Length (mm)", width=int(remaining_width * 0.3))
         
         # Update scrollbar positions
         vsb.set(*tree.yview())
