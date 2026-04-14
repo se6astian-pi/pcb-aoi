@@ -578,7 +578,7 @@ def launch_image_viewer(image_path, master=None, overlay_points=None, pad_locati
             resized = display_img.resize(new_size, Image.LANCZOS)
             
             # Convert to numpy array for OpenCV operations
-            img_array = np.asarray(resized)
+            img_array = np.array(resized)
 
             global pixel_per_mm_scale, pcb_w
             pixel_per_mm_scale = (new_size[0]-1) / pcb_w
