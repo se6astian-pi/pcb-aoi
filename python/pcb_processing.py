@@ -811,9 +811,13 @@ def launch_image_viewer(image_path, master=None, overlay_points=None, pad_locati
             img_w, img_h = curr_pil_img.size
             set_zoom(min(v_w / img_w, v_h / img_h))
 
+    # Configure window grid
+    window.columnconfigure(0, weight=1)
+    window.rowconfigure(1, weight=1)
+
     # Create UI
     control_frame = tk.Frame(window)
-    control_frame.pack(fill="x", padx=4, pady=4)
+    control_frame.grid(row=0, column=0, sticky="ew", padx=4, pady=4)
 
     tk.Label(control_frame, text=f"Viewing: {os.path.basename(image_path)}").pack(side="left")
     
@@ -838,11 +842,11 @@ def launch_image_viewer(image_path, master=None, overlay_points=None, pad_locati
 
     # Status bar
     status_bar = tk.Label(window, textvariable=status_var, bd=1, relief=tk.SUNKEN, anchor="w", padx=5)
-    status_bar.pack(side="bottom", fill="x")
+    status_bar.grid(row=2, column=0, sticky="ew")
 
     # Canvas
     container = tk.Frame(window)
-    container.pack(fill="both", expand=True)
+    container.grid(row=1, column=0, sticky="nsew")
 
     v_scroll = tk.Scrollbar(container, orient="vertical")
     h_scroll = tk.Scrollbar(container, orient="horizontal")
@@ -872,6 +876,12 @@ def launch_image_viewer(image_path, master=None, overlay_points=None, pad_locati
     window.bind_all("<Key>", lambda e: set_zoom(zoom_state["scale"] * 1.2) 
                    if e.keysym in ("plus", "equal", "=") else 
                    set_zoom(zoom_state["scale"] / 1.2) if e.keysym == "minus" else None)
+
+    def on_main_window_resize(event):
+        if event.widget == window:
+            update_display()
+
+    window.bind("<Configure>", on_main_window_resize)
 
     # Initial display
     set_image(pil_img)
@@ -930,9 +940,11 @@ def launch_mnt_viewer(mnt_path, master=None, components=None, image_viewer=None)
 
     # Apply saved geometry
     apply_saved_geometry(window, "MNTViewer")
+    window.columnconfigure(0, weight=1)
+    window.rowconfigure(0, weight=1)
 
     frame = ttk.Frame(window, padding=8)
-    frame.pack(fill="both", expand=True)
+    frame.grid(row=0, column=0, sticky="nsew")
 
     style = ttk.Style(window)
     style.configure("Treeview", rowheight=32)
@@ -955,6 +967,21 @@ def launch_mnt_viewer(mnt_path, master=None, components=None, image_viewer=None)
     hsb.grid(row=1, column=0, sticky="ew")
     frame.rowconfigure(0, weight=1)
     frame.columnconfigure(0, weight=1)
+
+    def on_tree_resize(event):
+        if event.widget != tree:
+            return
+        total_width = tree.winfo_width()
+        if total_width <= 100:
+            return
+
+        # Proportions for columns
+        # ["designator", "show", "x", "y", "rotation", "value", "package"]
+        props = [0.15, 0.1, 0.1, 0.1, 0.1, 0.2, 0.25]
+        for i, col in enumerate(columns):
+            tree.column(col, width=int(total_width * props[i]))
+
+    tree.bind("<Configure>", on_tree_resize)
 
     for comp in components:
         tree.insert("", "end", values=(
@@ -1075,6 +1102,8 @@ def launch_comparison_table(comparison_results, master=None):
             ttk.Label(scrollable_frame, text=package, anchor="center").grid(row=row, column=1, padx=5, pady=5, sticky="ew")
             ttk.Label(scrollable_frame, text=f"{max_val:.3f}", foreground=fg_color, anchor="center").grid(row=row, column=2, padx=5, pady=5, sticky="ew")
 
+            scrollable_frame.rowconfigure(row, weight=1)
+
             def create_photo(crop):
                 if crop is None or crop.size == 0: return None
                 h, w = crop.shape[:2]
@@ -1140,13 +1169,16 @@ def launch_config_viewer(cfg_path, master=None):
 
     # Apply saved geometry
     apply_saved_geometry(window, "ConfigViewer")
+    window.columnconfigure(0, weight=1)
+    window.rowconfigure(0, weight=1)
 
     frame = tk.Frame(window, padx=12, pady=12)
-    frame.pack(fill="both", expand=True)
+    frame.grid(row=0, column=0, sticky="nsew")
+    frame.columnconfigure(0, weight=1)
 
-    tk.Label(frame, text="PCB dimensions", font=(None, 12, "bold")).pack(anchor="w")
-    tk.Label(frame, text=f"Width: {width:.2f} mm").pack(anchor="w", pady=(8, 0))
-    tk.Label(frame, text=f"Height: {height:.2f} mm").pack(anchor="w")
+    tk.Label(frame, text="PCB dimensions", font=(None, 12, "bold")).grid(row=0, column=0, sticky="w")
+    tk.Label(frame, text=f"Width: {width:.2f} mm").grid(row=1, column=0, sticky="w", pady=(8, 0))
+    tk.Label(frame, text=f"Height: {height:.2f} mm").grid(row=2, column=0, sticky="w")
 
     def handle_closing():
         window.destroy()
