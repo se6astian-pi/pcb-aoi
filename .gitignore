@@ -1,3 +1,7 @@
 node_modules/
 .vscode/
 tmp/
+__pycache__/
+*.py[cod]
+*.class
+debug_crops/
