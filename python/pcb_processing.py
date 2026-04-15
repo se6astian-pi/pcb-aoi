@@ -1216,6 +1216,138 @@ def process_image_pipeline(image_path, fid_template, board_cfg, fiducial_pos_mm)
     )
     return img_color, img_gray, detected_fiducials, img_warped, transform, w, h
 
+
+def generate_overlay_data(components, pcb_w, pcb_h, warped_w, warped_h, pad_locations=None):
+    """
+    Generate overlay points and transformed pad locations.
+
+    Returns:
+        overlay_points, transformed_pad_locations, transform_matrix, pixel_per_mm_scale
+    """
+    if not (components and pcb_w and pcb_h):
+        return [], [], None, 0
+
+    M = compute_board_to_image_transform(pcb_w, pcb_h, warped_w, warped_h)
+    pixel_per_mm = (warped_w - 1) / pcb_w
+
+    overlay_points = transform_component_positions(components, M, warped_w, warped_h)
+
+    transformed_pads = []
+    if pad_locations:
+        transformed_pads = transform_pad_positions(pad_locations, M, warped_w, warped_h)
+
+    return overlay_points, transformed_pads, M, pixel_per_mm
+
+
+def compare_pcbs(img_ref_warped_gray, img_target_warped_gray, components, overlay_points_ref, overlay_points_target, pixel_per_mm_scale):
+    """
+    Compare components between two warped PCB images.
+
+    Returns:
+        List of comparison results
+    """
+    MATCH_THRESHOLD = 0.8  # for TM_CCOEFF_NORMED
+    comparison_results = []
+
+    #print(f"Comparing components between images with match threshold {MATCH_THRESHOLD}:")
+
+    for i, (ref_pt, comp_pt) in enumerate(zip(overlay_points_ref, overlay_points_target)):
+        if len(ref_pt) >= 5 and len(comp_pt) >= 5:
+            designator = ref_pt[2]
+
+            if designator.startswith("FID"):
+                continue  # Skip fiducials in comparison
+
+            # skip if package dimensions are zero
+            if (comp_pt[3] not in PACKAGE_DIMENSIONS) or (PACKAGE_DIMENSIONS[comp_pt[3]] == (0, 0)):
+                continue
+
+            ref_x, ref_y = int(ref_pt[0]), int(ref_pt[1])
+            comp_x, comp_y = int(comp_pt[0]), int(comp_pt[1])
+
+            # Calculate template size based on package
+            package = ref_pt[3]
+            rotation = ref_pt[4]
+
+            template = None
+            sec_crop = None
+            t_w, t_h = 20, 20  # Default size
+
+            if package in PACKAGE_DIMENSIONS:
+                pkg_w, pkg_h = PACKAGE_DIMENSIONS[package]
+
+                MARGIN = 1.5 #50% margin to account for slight misalignments
+
+                # Calculate size in pixels
+                px_w = pkg_w * pixel_per_mm_scale * MARGIN
+                px_h = pkg_h * pixel_per_mm_scale * MARGIN
+
+                # Swap dimensions if rotated approx 90 degrees
+                if 45 < (abs(rotation) % 180) < 135:
+                    px_w, px_h = px_h, px_w
+
+                t_w, t_h = int(px_w), int(px_h)
+                # Ensure minimum size
+                t_w = max(t_w, 10)
+                t_h = max(t_h, 10)
+
+            half_w = t_w // 2
+            half_h = t_h // 2
+
+            # Extract template from reference warped grayscale image
+            # Check bounds
+            if (ref_y - half_h < 0) or (ref_y + half_h >= img_ref_warped_gray.shape[0]) or \
+               (ref_x - half_w < 0) or (ref_x + half_w >= img_ref_warped_gray.shape[1]):
+                # Out of bounds, cannot extract template
+                match_status = False
+                diff_x = 0
+                diff_y = 0
+                max_val = 0
+                template = None
+                sec_crop = None
+            else:
+                template = img_ref_warped_gray[ref_y - half_h:ref_y + half_h, ref_x - half_w:ref_x + half_w]
+
+                # Extract corresponding crop from second image
+                if (comp_y - half_h >= 0) and (comp_y + half_h < img_target_warped_gray.shape[0]) and \
+                   (comp_x - half_w >= 0) and (comp_x + half_w < img_target_warped_gray.shape[1]):
+                    sec_crop = img_target_warped_gray[comp_y - half_h:comp_y + half_h, comp_x - half_w:comp_x + half_w]
+
+                    # Perform template matching
+                    if template.size > 0 and sec_crop.size > 0 and \
+                       sec_crop.shape[0] >= template.shape[0] and sec_crop.shape[1] >= template.shape[1]:
+                        result = cv2.matchTemplate(sec_crop, template, cv2.TM_CCOEFF_NORMED)
+                        _, max_val, _, max_loc = cv2.minMaxLoc(result)
+                        # Calculate center of matched template in second image
+                        matched_center_x = max_loc[0] + half_w
+                        matched_center_y = max_loc[1] + half_h
+                        # Calculate differences between matched position and expected position
+                        diff_x = abs(matched_center_x - comp_x)
+                        diff_y = abs(matched_center_y - comp_y)
+                        # Determine match status based on match value
+                        match_status = (max_val > MATCH_THRESHOLD)
+                    else:
+                        match_status = False
+                        diff_x = 0
+                        diff_y = 0
+                        max_val = 0
+                else:
+                    match_status = False
+                    diff_x = 0
+                    diff_y = 0
+                    max_val = 0
+                    sec_crop = None
+
+            diff_area = diff_x * diff_y
+
+            comparison_results.append((
+                designator, match_status, diff_x, diff_y, diff_area,
+                max_val, template, sec_crop, package
+            ))
+
+    return comparison_results
+
+
 # Main Processing
 
 def main():
@@ -1309,23 +1441,20 @@ def main():
     pcb_h = board_cfg.get("pcb_height")
 
     if components and fiducialBoardPositions and pcb_w and pcb_h:
-        half_w, half_h = pcb_w / 2, pcb_h / 2
-        
-        M = compute_board_to_image_transform(pcb_w, pcb_h, warped_w, warped_h)
+        overlay_points, transformed_pad_locations, M, pixel_per_mm_scale_res = generate_overlay_data(
+            components, pcb_w, pcb_h, warped_w, warped_h, pad_locations
+        )
         global pixel_per_mm_scale
-        pixel_per_mm_scale = (warped_w-1)/pcb_w
-        print(f"PCB: {pcb_w}x{pcb_h} mm, Scale: {(warped_w-1)/pcb_w:.2f} px/mm")
+        pixel_per_mm_scale = pixel_per_mm_scale_res
         
-        overlay_points.extend(transform_component_positions(components, M, warped_w, warped_h))
+        print(f"PCB: {pcb_w}x{pcb_h} mm, Scale: {pixel_per_mm_scale:.2f} px/mm")
         print(f"Generated {len(overlay_points)} overlay points")
-
-        if pad_locations: # If raw pad data was loaded
-            transformed_pad_locations = transform_pad_positions(pad_locations, M, warped_w, warped_h)
+        if transformed_pad_locations:
             print(f"Generated {len(transformed_pad_locations)} transformed pad locations")
 
         # Setup viewer transform
         if image_viewer:
-            image_viewer["set_board_transform"](M, half_w, half_h)
+            image_viewer["set_board_transform"](M, pcb_w / 2, pcb_h / 2)
             image_viewer["set_pad_locations"](transformed_pad_locations) # Update pad locations in viewer
 
     # Process second image for comparison if provided
@@ -1348,102 +1477,13 @@ def main():
                 overlay_points_second = transform_component_positions(components, M_second, warped_w_second, warped_h_second)
                 
                 # Compare each component using template matching
-                comparison_results = []
-                # Template matching parameters
-                MATCH_THRESHOLD = 0.8  # for TM_CCOEFF_NORMED
+                print(f"Comparing components between images...")
+                comparison_results = compare_pcbs(img_warped_gray, img_second_warped_gray, components, overlay_points, overlay_points_second, pixel_per_mm_scale)
                 
-                print(f"Comparing components between images with match threshold {MATCH_THRESHOLD}:")
+                for res in comparison_results:
+                    if not res[1]: # mismatch
+                         print(f"Component {res[0]}: MISMATCH (Δx={res[2]:.2f}, Δy={res[3]:.2f}, match_val={res[5]:.2f})")
 
-                debug_dir = "debug_crops"
-                if not os.path.exists(debug_dir):
-                    os.makedirs(debug_dir)
-
-                for i, (ref_pt, comp_pt) in enumerate(zip(overlay_points, overlay_points_second)):
-                    if len(ref_pt) >= 5 and len(comp_pt) >= 5:
-                        designator = ref_pt[2]
-                        
-                        if designator.startswith("FID"):
-                            continue  # Skip fiducials in comparison
-
-                        # skip if package dimensions are zero
-                        if (comp_pt[3] not in PACKAGE_DIMENSIONS) or (PACKAGE_DIMENSIONS[comp_pt[3]] == (0, 0)):
-                            continue
-
-                        ref_x, ref_y = int(ref_pt[0]), int(ref_pt[1])
-                        comp_x, comp_y = int(comp_pt[0]), int(comp_pt[1])
-
-                        # Calculate template size based on package
-                        package = ref_pt[3]
-                        rotation = ref_pt[4]
-                        
-                        template = None
-                        sec_crop = None
-                        t_w, t_h = 20, 20  # Default size
-                        
-                        if package in PACKAGE_DIMENSIONS:
-                            pkg_w, pkg_h = PACKAGE_DIMENSIONS[package]
-                            
-                            MARGIN = 1.5 #50% margin to account for slight misalignments
-                            
-                            # Calculate size in pixels
-                            px_w = pkg_w * pixel_per_mm_scale * MARGIN
-                            px_h = pkg_h * pixel_per_mm_scale * MARGIN
-                            
-                            # Swap dimensions if rotated approx 90 degrees
-                            if 45 < (abs(rotation) % 180) < 135:
-                                px_w, px_h = px_h, px_w
-                            
-                            t_w, t_h = int(px_w), int(px_h)
-                            # Ensure minimum size
-                            t_w = max(t_w, 10)
-                            t_h = max(t_h, 10)
-                        
-                        half_w = t_w // 2
-                        half_h = t_h // 2
-                        
-                        # Extract template from reference warped grayscale image
-                        # Check bounds
-                        if (ref_y - half_h < 0) or (ref_y + half_h >= img_warped_gray.shape[0]) or \
-                        (ref_x - half_w < 0) or (ref_x + half_w >= img_warped_gray.shape[1]):
-                            # Out of bounds, cannot extract template
-                            match_status = False
-                            diff_x = 0
-                            diff_y = 0
-                            max_val = 0
-                        else:
-                            template = img_warped_gray[ref_y - half_h:ref_y + half_h, ref_x - half_w:ref_x + half_w]
-                            
-                            # Save debug images
-                            cv2.imwrite(os.path.join(debug_dir, f"{designator}_ref.png"), template)
-                            
-                            # Extract corresponding crop from second image for debug
-                            if (comp_y - half_h >= 0) and (comp_y + half_h < img_second_warped_gray.shape[0]) and \
-                               (comp_x - half_w >= 0) and (comp_x + half_w < img_second_warped_gray.shape[1]):
-                                sec_crop = img_second_warped_gray[comp_y - half_h:comp_y + half_h, comp_x - half_w:comp_x + half_w]
-                                cv2.imwrite(os.path.join(debug_dir, f"{designator}_sec.png"), sec_crop)
-
-                            # Perform template matching on second warped grayscale image
-                            result = cv2.matchTemplate(sec_crop, template, cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-                            # Calculate center of matched template in second image
-                            matched_center_x = max_loc[0] + half_w
-                            matched_center_y = max_loc[1] + half_h
-                            # Calculate differences between matched position and expected position
-                            diff_x = abs(matched_center_x - comp_x)
-                            diff_y = abs(matched_center_y - comp_y)
-                            # Determine match status based on match value
-                            match_status = (max_val > MATCH_THRESHOLD) 
-                        
-                        diff_area = diff_x * diff_y  # maintain same format as before
-                        
-                        comparison_results.append((
-                            designator, match_status, diff_x, diff_y, diff_area,
-                            max_val, template, sec_crop, package
-                        ))
-
-                        if (max_val < MATCH_THRESHOLD):
-                            print(f"Component {designator}: {'MATCH' if match_status else 'MISMATCH'} (Δx={diff_x:.2f}, Δy={diff_y:.2f}, match_val={max_val:.2f})")
-                
                 # Store comparison results in viewer
                 if image_viewer:
                     image_viewer["comparison_results"] = comparison_results
