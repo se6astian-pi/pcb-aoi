@@ -605,9 +605,8 @@ def launch_image_viewer(image_path, master=None, overlay_points=None, pad_locati
             # Convert to numpy array for OpenCV operations
             img_array = np.array(resized)
 
-            global pixel_per_mm_scale, pcb_w
-            pixel_per_mm_scale = (new_size[0]-1) / pcb_w
-            #print(f"Pixel/mm scale: {pixel_per_mm_scale:.2f} px/mm")
+            # Calculate scale for the currently displayed (zoomed) image
+            display_px_mm = (new_size[0]-1) / pcb_w
             
             # Create results map for fast lookup
             results_map = {}
@@ -645,7 +644,7 @@ def launch_image_viewer(image_path, master=None, overlay_points=None, pad_locati
                     if package in PACKAGE_DIMENSIONS:
                         pkg_w, pkg_h = PACKAGE_DIMENSIONS[package]
                         center = (cx, cy)
-                        size = (pkg_w * pixel_per_mm_scale, pkg_h * pixel_per_mm_scale)
+                        size = (pkg_w * display_px_mm, pkg_h * display_px_mm)
                         angle = rotation
                         box = cv2.boxPoints((center, size, angle))
                         box = np.intp(box)
@@ -1284,25 +1283,27 @@ def main():
     else:
         base = os.path.splitext(image_path)[0]
 
+    # Load companion files
+    mnt_path = base + ".mnt"
+    cfg_path = base + ".cfg"
+
+    # Parse .cfg and update globals for UI and processing
+    global pcb_w, pcb_h, pixel_per_mm_scale
+    if os.path.exists(cfg_path):
+        board_cfg = parse_pcb_config(cfg_path)
+        pcb_w = board_cfg.get("pcb_width", 1.0)
+        pcb_h = board_cfg.get("pcb_height", 1.0)
+        launch_config_viewer(cfg_path, master=root)
+
     # Load pad locations if .csv exists
     pads_path = base + ".csv"
     if os.path.exists(pads_path):
         pad_locations = parse_pcb_pads_file(pads_path)
         print(f"Found {len(pad_locations)} pads in {pads_path}")
 
-
-    # Load companion files
-    mnt_path = base + ".mnt"
-    cfg_path = base + ".cfg"
-
     # Parse .mnt if not already done
     if os.path.exists(mnt_path) and not components:
         components = parse_mnt_file(mnt_path)
-    
-    # Parse .cfg
-    if os.path.exists(cfg_path):
-        board_cfg = parse_pcb_config(cfg_path)
-        launch_config_viewer(cfg_path, master=root)
 
     # Launch image viewer
     image_viewer = launch_image_viewer(image_path, master=root, overlay_points=overlay_points, pad_locations=[]) # Pass empty list initially
@@ -1329,15 +1330,9 @@ def main():
     img_warped_gray = cv2.cvtColor(img_warped, cv2.COLOR_RGB2GRAY)
     print(f"Warped: {warped_w}x{warped_h}")
 
-    # Compute component overlay positions
-    global pcb_w, pcb_h
-    pcb_w = board_cfg.get("pcb_width")
-    pcb_h = board_cfg.get("pcb_height")
-
-    if components and fiducialBoardPositions and pcb_w and pcb_h:
+    if components and fiducialBoardPositions and pcb_w > 1 and pcb_h > 1:
         half_w, half_h = pcb_w / 2.0, pcb_h / 2.0
         M = compute_board_to_image_transform(pcb_w, pcb_h, warped_w, warped_h, fiducialBoardPositions)
-        global pixel_per_mm_scale
         pixel_per_mm_scale = (warped_w - 1) / pcb_w
         print(f"PCB: {pcb_w}x{pcb_h} mm, Scale: {pixel_per_mm_scale:.2f} px/mm")
         
