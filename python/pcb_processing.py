@@ -71,6 +71,8 @@ from window_manager import apply_saved_geometry, set_window_geometry
 
 
 # Global Variables
+MATCH_THRESHOLD = 0.8
+SEARCH_PADDING = 20
 fiducialTemplate = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'templates', 'fiducial.tif')
 fiducialPositions = []  # Detected fiducial positions in image
 fiducialBoardPositions = {}  # Fiducial positions from .mnt file (mm, board coords)
@@ -132,15 +134,16 @@ def distance_2d(point1, point2):
     dy = point1[1] - point2[1]
     return (dx**2 + dy**2)**0.5
 
-def apply_perspective_transform(image, src_points, pcb_width=None, pcb_height=None, fiducial_positions_mm=None):
+def apply_perspective_transform(image, src_points, pcb_width=None, pcb_height=None, fiducial_positions_mm=None, target_size=None):
     """Apply 4-point perspective transform to get top-down view.
     
     Args:
         image: Input image
-        src_points: Source points in image pixel coordinates
+        src_points: Source points in image pixel coordinates (ordered: TL, BL, BR, TR)
         pcb_width: PCB width in mm (optional)
         pcb_height: PCB height in mm (optional)
         fiducial_positions_mm: Dict mapping fiducial names to (x,y) positions in mm (optional)
+        target_size: Optional (width, height) to force output size
     
     Returns:
         warped: Transformed image
@@ -148,70 +151,74 @@ def apply_perspective_transform(image, src_points, pcb_width=None, pcb_height=No
         output_width: Output width in pixels
         output_height: Output height in pixels
     """
-    def order_points(pts):
-        """Order points: top-left, top-right, bottom-right, bottom-left"""
-        s = pts.sum(axis=1)
-        d = np.diff(pts, axis=1).reshape(-1)
-        rect = np.zeros((4, 2), dtype="float32")
-        rect[0] = pts[np.argmin(s)]
-        rect[2] = pts[np.argmax(s)]
-        rect[1] = pts[np.argmin(d)]
-        rect[3] = pts[np.argmax(d)]
-        return rect
+    if not (fiducial_positions_mm and pcb_width and pcb_height):
+        # Fallback to simple rectangle ordering if no board data provided
+        def order_points(pts):
+            s = pts.sum(axis=1)
+            d = np.diff(pts, axis=1).reshape(-1)
+            rect = np.zeros((4, 2), dtype="float32")
+            rect[0] = pts[np.argmin(s)]
+            rect[2] = pts[np.argmax(s)]
+            rect[1] = pts[np.argmin(d)]
+            rect[3] = pts[np.argmax(d)]
+            return rect
+        rect = order_points(np.asarray(src_points, np.float32))
+        if target_size:
+            output_width, output_height = target_size
+        else:
+            output_width, output_height = 1000, 1000 # dummy
+        dst = np.array([[0, 0], [output_width-1, 0], [output_width-1, output_height-1], [0, output_height-1]], dtype="float32")
+        transform_matrix = cv2.getPerspectiveTransform(rect, dst)
+        warped = cv2.warpPerspective(image, transform_matrix, (output_width, output_height))
+        return warped, transform_matrix, output_width, output_height
 
-    # This moves rect points outwards to match pcb corners
-    # This is needed because the fiducials are usually inset from the actual PCB edges, 
-    # and we want the final transform to cover the entire PCB area.
-    # We can estimate the offset by comparing the detected fiducial positions to their 
-    # expected positions based on the PCB dimensions and fiducial board positions (if available).
-    #calculation in mm
-    offset_FID1 = ( pcb_width/2 - abs(fiducial_positions_mm['FID1'][0]), pcb_height/2 - abs(fiducial_positions_mm['FID1'][1]) ) 
-    offset_FID2 = ( pcb_width/2 - abs(fiducial_positions_mm['FID2'][0]), pcb_height/2 - abs(fiducial_positions_mm['FID2'][1]) )  
-    offset_FID3 = ( pcb_width/2 - abs(fiducial_positions_mm['FID3'][0]), pcb_height/2 - abs(fiducial_positions_mm['FID3'][1]) )  
-    offset_FID4 = ( pcb_width/2 - abs(fiducial_positions_mm['FID4'][0]), pcb_height/2 - abs(fiducial_positions_mm['FID4'][1]) )  
+    # Extract board fiducials and sort them TL, BL, BR, TR based on board space (Y-up)
+    fids_items = sorted(fiducial_positions_mm.items())
+    board_fids = np.array([item[1] for item in fids_items], dtype=np.float32)
 
-    rect = order_points(np.asarray(src_points, np.float32))
-    # Convert to numpy array for mutable operations and OpenCV compatibility
-    #rect = np.asarray(src_points, dtype=np.float32)
+    def sort_fiducials(pts):
+        """Sort points to TL, BL, BR, TR based on board coordinate system (Y-up)"""
+        avg_x = np.mean(pts[:, 0])
+        avg_y = np.mean(pts[:, 1])
+        tl = pts[(pts[:, 0] <= avg_x) & (pts[:, 1] >= avg_y)][0]
+        bl = pts[(pts[:, 0] <= avg_x) & (pts[:, 1] < avg_y)][0]
+        br = pts[(pts[:, 0] > avg_x) & (pts[:, 1] < avg_y)][0]
+        tr = pts[(pts[:, 0] > avg_x) & (pts[:, 1] >= avg_y)][0]
+        return np.array([tl, bl, br, tr], dtype=np.float32)
 
-    # Calculate distances between fiducials in pixels 
-    fid_width_px = distance_2d(rect[0], rect[1])
-    fid_height_px = distance_2d(rect[0], rect[3])    
+    sorted_board_fids = sort_fiducials(board_fids)
 
-    # Calculate distances between fiducials in mm 
-    fid_width_mm = distance_2d(fiducial_positions_mm['FID1'], fiducial_positions_mm['FID2'])
-    fid_height_mm = distance_2d(fiducial_positions_mm['FID1'], fiducial_positions_mm['FID4'])
+    # Detected src_points are already TL, BL, BR, TR from find_all_fiducials in image space (Y-down)
+    rect = np.asarray(src_points, dtype=np.float32)
 
-    #combine offset and fiducial positions to move rect points outwards and convert from mm to pixels
-    if fiducial_positions_mm and pcb_width and pcb_height:
-        rect[0][0] -= offset_FID1[0] * (fid_width_px / fid_width_mm)
-        rect[0][1] -= offset_FID1[1] * (fid_height_px / fid_height_mm)
-        
-        rect[1][0] += offset_FID2[0] * (fid_width_px / fid_width_mm)
-        rect[1][1] -= offset_FID2[1] * (fid_height_px / fid_height_mm)
-        
-        rect[2][0] += offset_FID3[0] * (fid_width_px / fid_width_mm)
-        rect[2][1] += offset_FID3[1] * (fid_height_px / fid_height_mm)
+    # Calculate pixel-per-mm scale based on diagonal fiducial distance
+    fid_dist_px = distance_2d(rect[0], rect[2])
+    fid_dist_mm = distance_2d(sorted_board_fids[0], sorted_board_fids[2])
+    px_per_mm = fid_dist_px / fid_dist_mm
 
-        rect[3][0] -= offset_FID4[0] * (fid_width_px / fid_width_mm)
-        rect[3][1] += offset_FID4[1] * (fid_height_px / fid_height_mm)
+    if target_size:
+        output_width, output_height = target_size
+    else:
+        output_width = int(pcb_width * px_per_mm)
+        output_height = int(pcb_height * px_per_mm)
 
-    width_px_per_mm = fid_width_px / fid_width_mm
-    height_px_per_mm = fid_height_px / fid_height_mm
-    output_width = int(pcb_width * fid_width_px / fid_width_mm)
-    output_height = int(pcb_height * fid_height_px / fid_height_mm)
-
-    # Destination corners in pixels taking into account the pcb_width and pcb_height (in mm) if provided 
-    dst = np.array([
-        [0, 0],
-        [output_width -1, 0],
-        [output_width -1, output_height -1],
-        [0, output_height -1]
-    ], dtype="float32")
+    # Calculate where board fiducials should map to in the warped image
+    # We define a centered mapping where the fiducial group's center in board space
+    # maps to the center of the warped image.
+    avg_bx = np.mean(sorted_board_fids[:, 0])
+    avg_by = np.mean(sorted_board_fids[:, 1])
     
-    # Compute transform and apply
-    # requires point order in: top-left, bottom-left, bottom-right, top-right
-    transform_matrix = cv2.getPerspectiveTransform(rect, dst)
+    board_to_dst_px = np.zeros((4, 2), dtype=np.float32)
+    for i in range(4):
+        # Calculate pixel offset from warped image center
+        # board Y is up, image Y is down
+        nx = (sorted_board_fids[i][0] - avg_bx) / pcb_width
+        ny = (sorted_board_fids[i][1] - avg_by) / pcb_height
+        board_to_dst_px[i][0] = (nx + 0.5) * (output_width - 1)
+        board_to_dst_px[i][1] = (0.5 - ny) * (output_height - 1)
+
+    # transform_matrix maps original image pixels to warped image pixels
+    transform_matrix = cv2.getPerspectiveTransform(rect, board_to_dst_px)
     warped = cv2.warpPerspective(image, transform_matrix, (output_width, output_height))
     
     return warped, transform_matrix, output_width, output_height
@@ -317,31 +324,49 @@ def parse_pcb_config(path):
     return cfg
 
 
-def compute_board_to_image_transform(pcb_width, pcb_height, img_width, img_height):
-    """Compute perspective transform from board coords to image coords."""
-    half_w = pcb_width / 2.0
-    half_h = pcb_height / 2.0
-    
-    # Board corners: top-left, top-right, bottom-right, bottom-left
-    board_corners = np.array([
-        [-half_w,  half_h],
-        [ half_w,  half_h],
-        [ half_w, -half_h],
-        [-half_w, -half_h],
-    ], dtype=np.float32)
-    
-    # Flip y for image space (board y-up, image y-down)
-    board_corners[:, 1] *= -1.0
-    
-    # Image corners
-    img_corners = np.array([
-        [0.0, 0.0],
-        [img_width - 1, 0.0],
-        [img_width - 1, img_height - 1],
-        [0.0, img_height - 1],
-    ], dtype=np.float32)
-    
-    return cv2.getPerspectiveTransform(board_corners, img_corners)
+def compute_board_to_image_transform(pcb_width, pcb_height, img_width, img_height, fiducial_board_positions=None):
+    """Compute perspective transform from board coords (mm) to warped image pixels."""
+    if fiducial_board_positions and len(fiducial_board_positions) >= 4:
+        fids_items = sorted(fiducial_board_positions.items())
+        board_fids = np.array([item[1] for item in fids_items], dtype=np.float32)
+
+        def sort_fiducials(pts):
+            avg_x = np.mean(pts[:, 0])
+            avg_y = np.mean(pts[:, 1])
+            tl = pts[(pts[:, 0] <= avg_x) & (pts[:, 1] >= avg_y)][0]
+            bl = pts[(pts[:, 0] <= avg_x) & (pts[:, 1] < avg_y)][0]
+            br = pts[(pts[:, 0] > avg_x) & (pts[:, 1] < avg_y)][0]
+            tr = pts[(pts[:, 0] > avg_x) & (pts[:, 1] >= avg_y)][0]
+            return np.array([tl, bl, br, tr], dtype=np.float32)
+
+        sorted_board_fids = sort_fiducials(board_fids)
+        avg_bx = np.mean(sorted_board_fids[:, 0])
+        avg_by = np.mean(sorted_board_fids[:, 1])
+
+        board_to_dst_px = np.zeros((4, 2), dtype=np.float32)
+        for i in range(4):
+            nx = (sorted_board_fids[i][0] - avg_bx) / pcb_width
+            ny = (sorted_board_fids[i][1] - avg_by) / pcb_height
+            board_to_dst_px[i][0] = (nx + 0.5) * (img_width - 1)
+            board_to_dst_px[i][1] = (0.5 - ny) * (img_height - 1)
+
+        # The existing transform_component_positions expects a transform that takes (X, -Y)
+        board_pts_for_transform = np.zeros((4, 2), dtype=np.float32)
+        for i in range(4):
+            board_pts_for_transform[i][0] = sorted_board_fids[i][0]
+            board_pts_for_transform[i][1] = -sorted_board_fids[i][1]
+
+        return cv2.getPerspectiveTransform(board_pts_for_transform, board_to_dst_px)
+    else:
+        half_w = pcb_width / 2.0
+        half_h = pcb_height / 2.0
+        board_corners = np.array([
+            [-half_w,  half_h], [ half_w,  half_h],
+            [ half_w, -half_h], [-half_w, -half_h]
+        ], dtype=np.float32)
+        board_corners[:, 1] *= -1.0
+        img_corners = np.array([[0, 0], [img_width-1, 0], [img_width-1, img_height-1], [0, img_height-1]], dtype="float32")
+        return cv2.getPerspectiveTransform(board_corners, img_corners)
 
 
 def transform_component_positions(components, transform_matrix, img_width, img_height):
@@ -1191,7 +1216,7 @@ def launch_config_viewer(cfg_path, master=None):
     if owns_root:
         window.mainloop()
 
-def process_image_pipeline(image_path, fid_template, board_cfg, fiducial_pos_mm):
+def process_image_pipeline(image_path, fid_template, board_cfg, fiducial_pos_mm, target_size=None):
     """Load image, detect fiducials, and apply perspective transform."""
     img_color = cv2.imread(image_path, 1)
     if img_color is None:
@@ -1212,7 +1237,8 @@ def process_image_pipeline(image_path, fid_template, board_cfg, fiducial_pos_mm)
         img_color, detected_fiducials,
         pcb_width=board_cfg.get("pcb_width"),
         pcb_height=board_cfg.get("pcb_height"),
-        fiducial_positions_mm=fiducial_pos_mm
+        fiducial_positions_mm=fiducial_pos_mm,
+        target_size=target_size
     )
     return img_color, img_gray, detected_fiducials, img_warped, transform, w, h
 
@@ -1309,12 +1335,11 @@ def main():
     pcb_h = board_cfg.get("pcb_height")
 
     if components and fiducialBoardPositions and pcb_w and pcb_h:
-        half_w, half_h = pcb_w / 2, pcb_h / 2
-        
-        M = compute_board_to_image_transform(pcb_w, pcb_h, warped_w, warped_h)
+        half_w, half_h = pcb_w / 2.0, pcb_h / 2.0
+        M = compute_board_to_image_transform(pcb_w, pcb_h, warped_w, warped_h, fiducialBoardPositions)
         global pixel_per_mm_scale
-        pixel_per_mm_scale = (warped_w-1)/pcb_w
-        print(f"PCB: {pcb_w}x{pcb_h} mm, Scale: {(warped_w-1)/pcb_w:.2f} px/mm")
+        pixel_per_mm_scale = (warped_w - 1) / pcb_w
+        print(f"PCB: {pcb_w}x{pcb_h} mm, Scale: {pixel_per_mm_scale:.2f} px/mm")
         
         overlay_points.extend(transform_component_positions(components, M, warped_w, warped_h))
         print(f"Generated {len(overlay_points)} overlay points")
@@ -1332,9 +1357,9 @@ def main():
     if second_image_path and os.path.exists(second_image_path):
         print(f"\nProcessing comparison image: {second_image_path}")
         
-        # Use pipeline for second image
+        # Use pipeline for second image with the same target size as the reference
         _, _, _, img_second_warped, transform_second, warped_w_second, warped_h_second = process_image_pipeline(
-            second_image_path, template, board_cfg, fiducialBoardPositions
+            second_image_path, template, board_cfg, fiducialBoardPositions, target_size=(warped_w, warped_h)
         )
 
         if img_second_warped is not None:
@@ -1344,13 +1369,11 @@ def main():
             if components and pcb_w and pcb_h:
                 
                 # Transform component positions for second image
-                M_second = compute_board_to_image_transform(pcb_w, pcb_h, warped_w_second, warped_h_second)
+                M_second = compute_board_to_image_transform(pcb_w, pcb_h, warped_w_second, warped_h_second, fiducialBoardPositions)
                 overlay_points_second = transform_component_positions(components, M_second, warped_w_second, warped_h_second)
                 
                 # Compare each component using template matching
                 comparison_results = []
-                # Template matching parameters
-                MATCH_THRESHOLD = 0.8  # for TM_CCOEFF_NORMED
                 
                 print(f"Comparing components between images with match threshold {MATCH_THRESHOLD}:")
 
@@ -1410,35 +1433,55 @@ def main():
                             diff_x = 0
                             diff_y = 0
                             max_val = 0
+                            comp_template = None
+                            sec_crop = None
                         else:
-                            template = img_warped_gray[ref_y - half_h:ref_y + half_h, ref_x - half_w:ref_x + half_w]
+                            comp_template = img_warped_gray[ref_y - half_h:ref_y + half_h, ref_x - half_w:ref_x + half_w]
                             
                             # Save debug images
-                            cv2.imwrite(os.path.join(debug_dir, f"{designator}_ref.png"), template)
+                            cv2.imwrite(os.path.join(debug_dir, f"{designator}_ref.png"), comp_template)
+
+                            # Extract larger search area from second image
+                            search_y1 = max(0, comp_y - half_h - SEARCH_PADDING)
+                            search_y2 = min(img_second_warped_gray.shape[0], comp_y + half_h + SEARCH_PADDING)
+                            search_x1 = max(0, comp_x - half_w - SEARCH_PADDING)
+                            search_x2 = min(img_second_warped_gray.shape[1], comp_x + half_w + SEARCH_PADDING)
                             
-                            # Extract corresponding crop from second image for debug
+                            sec_search_crop = img_second_warped_gray[search_y1:search_y2, search_x1:search_x2]
+
+                            # Extract standard crop for display
                             if (comp_y - half_h >= 0) and (comp_y + half_h < img_second_warped_gray.shape[0]) and \
                                (comp_x - half_w >= 0) and (comp_x + half_w < img_second_warped_gray.shape[1]):
                                 sec_crop = img_second_warped_gray[comp_y - half_h:comp_y + half_h, comp_x - half_w:comp_x + half_w]
                                 cv2.imwrite(os.path.join(debug_dir, f"{designator}_sec.png"), sec_crop)
+                            else:
+                                sec_crop = None
 
-                            # Perform template matching on second warped grayscale image
-                            result = cv2.matchTemplate(sec_crop, template, cv2.TM_CCOEFF_NORMED)
-                            _, max_val, _, max_loc = cv2.minMaxLoc(result)
-                            # Calculate center of matched template in second image
-                            matched_center_x = max_loc[0] + half_w
-                            matched_center_y = max_loc[1] + half_h
-                            # Calculate differences between matched position and expected position
-                            diff_x = abs(matched_center_x - comp_x)
-                            diff_y = abs(matched_center_y - comp_y)
-                            # Determine match status based on match value
-                            match_status = (max_val > MATCH_THRESHOLD) 
+                            if sec_search_crop.shape[0] >= comp_template.shape[0] and sec_search_crop.shape[1] >= comp_template.shape[1]:
+                                # Perform template matching on second warped grayscale image
+                                result = cv2.matchTemplate(sec_search_crop, comp_template, cv2.TM_CCOEFF_NORMED)
+                                _, max_val, _, max_loc = cv2.minMaxLoc(result)
+
+                                # Calculate absolute center of matched template in second image
+                                matched_center_x = search_x1 + max_loc[0] + half_w
+                                matched_center_y = search_y1 + max_loc[1] + half_h
+
+                                # Calculate differences between matched position and expected position
+                                diff_x = abs(matched_center_x - comp_x)
+                                diff_y = abs(matched_center_y - comp_y)
+                                # Determine match status based on match value
+                                match_status = (max_val > MATCH_THRESHOLD)
+                            else:
+                                match_status = False
+                                diff_x = 0
+                                diff_y = 0
+                                max_val = 0
                         
                         diff_area = diff_x * diff_y  # maintain same format as before
                         
                         comparison_results.append((
                             designator, match_status, diff_x, diff_y, diff_area,
-                            max_val, template, sec_crop, package
+                            max_val, comp_template, sec_crop, package
                         ))
 
                         if (max_val < MATCH_THRESHOLD):
